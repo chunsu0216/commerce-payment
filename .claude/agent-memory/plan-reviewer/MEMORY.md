@@ -1,0 +1,1 @@
+- [Payment flow review pitfalls](project_payment_flow_pitfalls.md) — 결제 승인 플로우(TX1/TX2/보상TX3) 계획에서 반복되는 설계 공백 패턴 및 이 프로젝트의 구조적 사실
