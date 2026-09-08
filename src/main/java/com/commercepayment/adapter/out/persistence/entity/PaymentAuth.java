@@ -57,6 +57,9 @@ public class PaymentAuth extends BaseEntity {
 
     private PaymentMethod paymentMethod;
 
+    @Column(name = "m_id", nullable = false, length = 100)
+    private String mId;
+
     @Column(name = "pg_auth_key", nullable = false, length = 100)
     private String pgAuthKey;
 
@@ -91,6 +94,8 @@ public class PaymentAuth extends BaseEntity {
 
             PaymentMethod paymentMethod,
 
+            String mId,
+
             String pgAuthKey,
 
             String pgTransactionId,
@@ -116,6 +121,8 @@ public class PaymentAuth extends BaseEntity {
         this.pgProvider = pgProvider;
 
         this.paymentMethod = paymentMethod;
+
+        this.mId = mId;
 
         this.pgAuthKey = pgAuthKey;
 

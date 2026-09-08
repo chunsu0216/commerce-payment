@@ -75,6 +75,7 @@ public class PaymentAuthRegistrationService {
                 command.memberId(),
                 command.pgProvider(),
                 command.paymentMethod(),
+                command.mId(),
                 command.pgAuthKey(),
                 command.pgTransactionId(),
                 authStatus,

@@ -95,6 +95,10 @@ public class PaymentCancel extends BaseEntity {
 
     private LocalDateTime cancelledAt;
 
+    @Column(name = "retry_count", nullable = false)
+
+    private Integer retryCount;
+
     public PaymentCancel(
 
             String cancelId,
@@ -126,6 +130,8 @@ public class PaymentCancel extends BaseEntity {
         this.cancelStatus = CancelStatus.PROCESSING;
 
         this.requestedAt = LocalDateTime.now();
+
+        this.retryCount = 0;
 
     }
 
@@ -180,6 +186,15 @@ public class PaymentCancel extends BaseEntity {
         this.pgResultCode = pgResultCode;
 
         this.pgResultMessage = pgResultMessage;
+
+    }
+
+    /**
+     * 결과 판단 불가(UNKNOWN)로 재시도가 필요할 때마다 재시도 횟수를 1 증가시킨다
+     */
+    public void increaseRetryCount() {
+
+        this.retryCount += 1;
 
     }
 

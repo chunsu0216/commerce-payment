@@ -28,6 +28,7 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -56,45 +57,86 @@ class PaymentCompensationServiceTest {
     }
 
     @Test
-    void 원래_승인이_성공이었으면_approvedAmount_를_복구한_뒤_전액_취소로_확정된다() {
+    void 원래_승인이_성공이었으면_PENDING_상태의_PaymentCancel_을_먼저_커밋하고_Payment_는_아직_취소되지_않는다() {
         Payment payment = new Payment("payment-1", "auth-1", "order-1", 100L, PaymentMethod.CARD, PgProvider.INICIS, 10000L);
         when(paymentPersistencePort.findByPaymentId("payment-1")).thenReturn(Optional.of(payment));
+        when(paymentCancelPersistencePort.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
 
         PgApprovalResult originalResult = new PgApprovalResult(PgApprovalStatus.SUCCESS, "pg-tx-1", 10000L, "0000", "정상 승인", LocalDateTime.now());
-        PgCancelResult cancelResult = new PgCancelResult(PgCancelStatus.SUCCESS, "pg-cancel-1", "0000", "정상 취소");
 
-        paymentCompensationService.recordCompensation("payment-1", originalResult, cancelResult);
+        PaymentCancel pendingCancel = paymentCompensationService.recordPendingCancel("payment-1", originalResult);
 
-        // approvedAmount 가 먼저 복구된 뒤 cancel() 이 호출되어야 cancelledAmount == approvedAmount 가 되어 CANCELLED 로 전이된다
+        // approvedAmount 는 복구되지만, 아직 PG 취소 결과를 모르므로 Payment 는 취소 상태로 전이되지 않는다
         assertThat(payment.getApprovedAmount()).isEqualTo(10000L);
+        assertThat(payment.getCancelledAmount()).isZero();
+        assertThat(payment.getPaymentStatus()).isEqualTo(PaymentStatus.SUCCESS);
+
+        assertThat(pendingCancel.getCancelType()).isEqualTo(CancelType.COMPENSATION);
+        assertThat(pendingCancel.getCancelAmount()).isEqualTo(10000L);
+        assertThat(pendingCancel.getCancelStatus()).isEqualTo(CancelStatus.PROCESSING);
+
+        verify(paymentOutboxPersistencePort, never()).save(any());
+    }
+
+    @Test
+    void 원래_승인이_실패였으면_취소금액_없이_PENDING_상태로만_커밋된다() {
+        Payment payment = new Payment("payment-1", "auth-1", "order-1", 100L, PaymentMethod.CARD, PgProvider.INICIS, 10000L);
+        when(paymentPersistencePort.findByPaymentId("payment-1")).thenReturn(Optional.of(payment));
+        when(paymentCancelPersistencePort.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PgApprovalResult originalResult = new PgApprovalResult(PgApprovalStatus.FAILED, null, 0L, "9999", "승인 거절", null);
+
+        PaymentCancel pendingCancel = paymentCompensationService.recordPendingCancel("payment-1", originalResult);
+
+        assertThat(payment.getPaymentStatus()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(pendingCancel.getCancelAmount()).isEqualTo(0L);
+    }
+
+    @Test
+    void 망취소_결과가_SUCCESS_이면_PaymentCancel_과_Payment_가_취소로_확정되고_이벤트가_발행된다() {
+        Payment payment = new Payment("payment-1", "auth-1", "order-1", 100L, PaymentMethod.CARD, PgProvider.INICIS, 10000L);
+        payment.success("pg-tx-1", 10000L, "0000", "정상 승인");
+        PaymentCancel paymentCancel = new PaymentCancel("cancel-1", "payment-1", "req-1", CancelType.COMPENSATION, 10000L, "보상 취소");
+        when(paymentPersistencePort.findByPaymentId("payment-1")).thenReturn(Optional.of(payment));
+        when(paymentCancelPersistencePort.findByCancelId("cancel-1")).thenReturn(Optional.of(paymentCancel));
+
+        PgCancelResult cancelResult = new PgCancelResult(PgCancelStatus.SUCCESS, "pg-cancel-1", "0000", "정상 취소");
+        paymentCompensationService.applyFinalCancelResult("cancel-1", cancelResult);
+
+        assertThat(paymentCancel.getCancelStatus()).isEqualTo(CancelStatus.SUCCESS);
         assertThat(payment.getCancelledAmount()).isEqualTo(10000L);
         assertThat(payment.getPaymentStatus()).isEqualTo(PaymentStatus.CANCELLED);
-
-        ArgumentCaptor<PaymentCancel> captor = ArgumentCaptor.forClass(PaymentCancel.class);
-        verify(paymentCancelPersistencePort).save(captor.capture());
-        PaymentCancel savedCancel = captor.getValue();
-        assertThat(savedCancel.getCancelType()).isEqualTo(CancelType.COMPENSATION);
-        assertThat(savedCancel.getCancelAmount()).isEqualTo(10000L);
-        assertThat(savedCancel.getCancelStatus()).isEqualTo(CancelStatus.SUCCESS);
-
         verify(paymentOutboxPersistencePort).save(any());
     }
 
     @Test
-    void 원래_승인이_실패였으면_취소금액_없이_실패_상태로만_재확정된다() {
+    void 망취소_결과가_FAILED_이면_PaymentCancel_만_실패로_확정되고_Payment_는_취소되지_않은_채_이벤트가_발행된다() {
         Payment payment = new Payment("payment-1", "auth-1", "order-1", 100L, PaymentMethod.CARD, PgProvider.INICIS, 10000L);
+        payment.success("pg-tx-1", 10000L, "0000", "정상 승인");
+        PaymentCancel paymentCancel = new PaymentCancel("cancel-1", "payment-1", "req-1", CancelType.COMPENSATION, 10000L, "보상 취소");
         when(paymentPersistencePort.findByPaymentId("payment-1")).thenReturn(Optional.of(payment));
+        when(paymentCancelPersistencePort.findByCancelId("cancel-1")).thenReturn(Optional.of(paymentCancel));
 
-        PgApprovalResult originalResult = new PgApprovalResult(PgApprovalStatus.FAILED, null, 0L, "9999", "승인 거절", null);
-        PgCancelResult cancelResult = new PgCancelResult(PgCancelStatus.SUCCESS, "pg-cancel-1", "0000", "정상 취소");
+        PgCancelResult cancelResult = new PgCancelResult(PgCancelStatus.FAILED, null, "9999", "취소 거절");
+        paymentCompensationService.applyFinalCancelResult("cancel-1", cancelResult);
 
-        paymentCompensationService.recordCompensation("payment-1", originalResult, cancelResult);
-
-        assertThat(payment.getPaymentStatus()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(paymentCancel.getCancelStatus()).isEqualTo(CancelStatus.FAILED);
         assertThat(payment.getCancelledAmount()).isZero();
+        assertThat(payment.getPaymentStatus()).isEqualTo(PaymentStatus.SUCCESS);
+        verify(paymentOutboxPersistencePort).save(any());
+    }
 
-        ArgumentCaptor<PaymentCancel> captor = ArgumentCaptor.forClass(PaymentCancel.class);
-        verify(paymentCancelPersistencePort).save(captor.capture());
-        assertThat(captor.getValue().getCancelAmount()).isEqualTo(0L);
+    @Test
+    void 망취소_결과가_UNKNOWN_이면_재시도_횟수만_증가하고_이벤트는_발행되지_않는다() {
+        PaymentCancel paymentCancel = new PaymentCancel("cancel-1", "payment-1", "req-1", CancelType.COMPENSATION, 10000L, "보상 취소");
+        when(paymentCancelPersistencePort.findByCancelId("cancel-1")).thenReturn(Optional.of(paymentCancel));
+
+        PgCancelResult cancelResult = new PgCancelResult(PgCancelStatus.UNKNOWN, null, "TIMEOUT", "응답 없음");
+        paymentCompensationService.applyFinalCancelResult("cancel-1", cancelResult);
+
+        assertThat(paymentCancel.getCancelStatus()).isEqualTo(CancelStatus.UNKNOWN);
+        assertThat(paymentCancel.getRetryCount()).isEqualTo(1);
+        verify(paymentPersistencePort, never()).findByPaymentId(any());
+        verify(paymentOutboxPersistencePort, never()).save(any());
     }
 }

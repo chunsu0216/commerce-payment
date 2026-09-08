@@ -9,6 +9,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 
+import java.util.Optional;
+
 /**
  * PaymentAuthPersistencePort 를 JPA 로 구현하는 아웃바운드 어댑터
  */
@@ -24,6 +26,14 @@ public class PaymentAuthPersistenceAdapter implements PaymentAuthPersistencePort
     @Override
     public boolean existsByPgProviderAndPgAuthKey(PgProvider pgProvider, String pgAuthKey) {
         return paymentAuthJpaRepository.existsByPgProviderAndPgAuthKey(pgProvider, pgAuthKey);
+    }
+
+    /**
+     * authId 로 인증 정보를 조회한다
+     */
+    @Override
+    public Optional<PaymentAuth> findByAuthId(String authId) {
+        return paymentAuthJpaRepository.findByAuthId(authId);
     }
 
     /**

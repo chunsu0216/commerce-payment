@@ -1,6 +1,8 @@
 package com.commercepayment.application.service;
 
 import com.commercepayment.adapter.out.persistence.entity.AuthStatus;
+import com.commercepayment.adapter.out.persistence.entity.CancelType;
+import com.commercepayment.adapter.out.persistence.entity.PaymentCancel;
 import com.commercepayment.adapter.out.persistence.entity.PaymentMethod;
 import com.commercepayment.adapter.out.persistence.entity.PaymentStatus;
 import com.commercepayment.adapter.out.persistence.entity.PgProvider;
@@ -8,14 +10,11 @@ import com.commercepayment.application.dto.PaymentApprovalCommand;
 import com.commercepayment.application.dto.PaymentApprovalResult;
 import com.commercepayment.application.dto.PaymentAuthRegistrationResult;
 import com.commercepayment.application.dto.PgApprovalResult;
-import com.commercepayment.application.dto.PgCancelResult;
 import com.commercepayment.application.port.out.DistributedLockPort;
 import com.commercepayment.application.port.out.PgApprovalPort;
-import com.commercepayment.application.port.out.PgCancelPort;
 import com.commercepayment.common.exception.PaymentCompensatedException;
 import com.commercepayment.config.PaymentLockProperties;
 import com.commercepayment.domain.payment.PgApprovalStatus;
-import com.commercepayment.domain.payment.PgCancelStatus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -50,10 +49,10 @@ class CardPaymentApprovalFacadeServiceTest {
     private PaymentCompensationService paymentCompensationService;
 
     @Mock
-    private PgApprovalPort pgApprovalPort;
+    private PaymentCancelExecutionService paymentCancelExecutionService;
 
     @Mock
-    private PgCancelPort pgCancelPort;
+    private PgApprovalPort pgApprovalPort;
 
     private CardPaymentApprovalFacadeService facade;
 
@@ -70,8 +69,8 @@ class CardPaymentApprovalFacadeServiceTest {
                 paymentAuthRegistrationService,
                 paymentResultService,
                 paymentCompensationService,
-                pgApprovalPort,
-                pgCancelPort
+                paymentCancelExecutionService,
+                pgApprovalPort
         );
 
         successAuthCommand = new PaymentApprovalCommand(
@@ -116,25 +115,25 @@ class CardPaymentApprovalFacadeServiceTest {
         assertThat(result.paymentId()).isEqualTo("payment-1");
         assertThat(result.paymentStatus()).isEqualTo(PaymentStatus.SUCCESS);
         verify(paymentResultService).applyApprovalResult(eq("payment-1"), any());
-        verify(paymentCompensationService, never()).recordCompensation(any(), any(), any());
+        verify(paymentCompensationService, never()).recordPendingCancel(any(), any());
     }
 
     @Test
-    void TX2_가_실패하면_PG_망취소와_보상처리를_수행하고_보상완료_예외를_던진다() {
+    void TX2_가_실패하면_PaymentCancel_을_선커밋한_뒤_취소_실행을_위임하고_보상완료_예외를_던진다() {
         when(paymentAuthRegistrationService.registerAuthAndPayment(successAuthCommand))
                 .thenReturn(new PaymentAuthRegistrationResult("payment-1", "auth-1", 10000L));
         when(pgApprovalPort.approve(any(), any()))
                 .thenReturn(new PgApprovalResult(PgApprovalStatus.SUCCESS, "pg-tx-1", 10000L, "0000", "정상 승인", LocalDateTime.now()));
         doThrow(new RuntimeException("DB 커밋 실패"))
                 .when(paymentResultService).applyApprovalResult(anyString(), any());
-        when(pgCancelPort.cancel(any(), any()))
-                .thenReturn(new PgCancelResult(PgCancelStatus.SUCCESS, "pg-cancel-1", "0000", "정상 취소"));
+        PaymentCancel pendingCancel = new PaymentCancel("cancel-1", "payment-1", "req-1", CancelType.COMPENSATION, 10000L, "보상 취소");
+        when(paymentCompensationService.recordPendingCancel(anyString(), any())).thenReturn(pendingCancel);
 
         assertThatThrownBy(() -> facade.processApproval(successAuthCommand))
                 .isInstanceOf(PaymentCompensatedException.class);
 
-        verify(pgCancelPort).cancel(any(), any());
-        verify(paymentCompensationService).recordCompensation(anyString(), any(), any());
+        verify(paymentCompensationService).recordPendingCancel(eq("payment-1"), any());
+        verify(paymentCancelExecutionService).executeCancel("cancel-1");
     }
 
     @Test

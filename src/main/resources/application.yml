@@ -102,6 +102,12 @@ order-status:
 payment-lock:
   wait-seconds: 3
 
+payment-cancel-recovery:
+  fixed-delay-ms: 5000
+  stale-seconds: 60
+  batch-size: 50
+  max-retry-count: 10
+
 logging:
   level:
     com.commerce.order.adapter.out.client: DEBUG

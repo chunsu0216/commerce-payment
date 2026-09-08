@@ -9,6 +9,7 @@ import com.commercepayment.application.dto.PgCancelResult;
 import com.commercepayment.application.port.out.PaymentCancelPersistencePort;
 import com.commercepayment.application.port.out.PaymentOutboxPersistencePort;
 import com.commercepayment.application.port.out.PaymentPersistencePort;
+import com.commercepayment.common.exception.PaymentCancelNotFoundException;
 import com.commercepayment.common.exception.PaymentNotFoundException;
 import com.commercepayment.domain.payment.PgApprovalStatus;
 import lombok.RequiredArgsConstructor;
@@ -18,7 +19,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.UUID;
 
 /**
- * 결제 승인 플로우의 TX3(TX2 실패에 대한 보상 처리)를 담당하는 서비스
+ * 결제 승인 플로우의 TX2 실패에 대한 보상 취소를 담당하는 서비스.
+ * "PG 망취소 호출 전 PENDING 선커밋"과 "조회/취소 결과 최종 확정"을 별도 트랜잭션으로 분리해,
+ * PG 호출 도중 앱이 죽어도 recovery scheduler 가 PaymentCancel 레코드를 이어받아 재처리할 수 있게 한다.
  */
 @Service
 @RequiredArgsConstructor
@@ -33,24 +36,53 @@ public class PaymentCompensationService {
     private final PaymentEventPayloadFactory paymentEventPayloadFactory;
 
     /**
-     * TX2 에서 롤백된 원래 승인 결과를 재적용하고, PG 망취소 결과를 PaymentCancel(COMPENSATION)로 기록한 뒤
-     * 최종 결과를 아웃박스에 적재한다
+     * TX2 에서 롤백된 원래 승인 결과를 Payment 에 재반영하고, PG 망취소 호출 전에 PaymentCancel(PROCESSING) 을 먼저 커밋한다.
+     * 이 시점에는 아직 PG 호출 결과를 모르므로 Payment 를 취소 상태로 확정하지 않고, 아웃박스 이벤트도 발행하지 않는다.
      */
     @Transactional
-    public void recordCompensation(String paymentId, PgApprovalResult originalResult, PgCancelResult cancelResult) {
+    public PaymentCancel recordPendingCancel(String paymentId, PgApprovalResult originalResult) {
         Payment payment = findPayment(paymentId);
-
         reapplyOriginalResult(payment, originalResult);
+
         boolean wasApproved = originalResult.status() == PgApprovalStatus.SUCCESS;
-        if (wasApproved) {
-            payment.cancel(originalResult.approvedAmount());
+        Long cancelAmount = wasApproved ? originalResult.approvedAmount() : 0L;
+        PaymentCancel paymentCancel = new PaymentCancel(
+                UUID.randomUUID().toString(),
+                payment.getPaymentId(),
+                UUID.randomUUID().toString(),
+                CancelType.COMPENSATION,
+                cancelAmount,
+                COMPENSATION_REASON
+        );
+        return paymentCancelPersistencePort.save(paymentCancel);
+    }
+
+    /**
+     * PG 조회/망취소 결과를 PaymentCancel 에 최종 반영한다.
+     * PG 기준 정상 취소가 확정된 경우(SUCCESS)에만 Payment 를 취소 상태로 전이시키고 결과 이벤트를 발행한다.
+     * FAILED(취소 실패 확정)에도 결과 이벤트를 발행해 원래 승인 결과를 다운스트림에 알리며,
+     * UNKNOWN(판단 불가)은 재시도 대상으로 남기고 이벤트를 발행하지 않는다.
+     */
+    @Transactional
+    public void applyFinalCancelResult(String cancelId, PgCancelResult cancelResult) {
+        PaymentCancel paymentCancel = findPaymentCancel(cancelId);
+
+        switch (cancelResult.status()) {
+            case SUCCESS -> {
+                paymentCancel.success(cancelResult.pgCancelId(), cancelResult.pgResultCode(), cancelResult.pgResultMessage());
+                Payment payment = findPayment(paymentCancel.getPaymentId());
+                payment.cancel(paymentCancel.getCancelAmount());
+                publishPaymentResultEvent(payment);
+            }
+            case FAILED -> {
+                paymentCancel.fail(cancelResult.pgResultCode(), cancelResult.pgResultMessage());
+                publishPaymentResultEvent(findPayment(paymentCancel.getPaymentId()));
+            }
+            case UNKNOWN -> {
+                paymentCancel.unknown(cancelResult.pgResultCode(), cancelResult.pgResultMessage());
+                paymentCancel.increaseRetryCount();
+            }
         }
-
-        PaymentCancel paymentCancel = createPaymentCancel(payment, originalResult, wasApproved);
-        applyCancelResult(paymentCancel, cancelResult);
-        paymentCancelPersistencePort.save(paymentCancel);
-
-        publishPaymentResultEvent(payment);
     }
 
     /**
@@ -61,32 +93,6 @@ public class PaymentCompensationService {
             case SUCCESS -> payment.success(result.pgTransactionId(), result.approvedAmount(), result.pgResultCode(), result.pgResultMessage());
             case FAILED -> payment.fail(result.pgResultCode(), result.pgResultMessage());
             case UNKNOWN -> payment.unknown(result.pgResultCode(), result.pgResultMessage());
-        }
-    }
-
-    /**
-     * 보상 취소 이력을 표현하는 PaymentCancel 엔티티를 생성한다
-     */
-    private PaymentCancel createPaymentCancel(Payment payment, PgApprovalResult originalResult, boolean wasApproved) {
-        Long cancelAmount = wasApproved ? originalResult.approvedAmount() : 0L;
-        return new PaymentCancel(
-                UUID.randomUUID().toString(),
-                payment.getPaymentId(),
-                UUID.randomUUID().toString(),
-                CancelType.COMPENSATION,
-                cancelAmount,
-                COMPENSATION_REASON
-        );
-    }
-
-    /**
-     * PG 망취소 호출 결과를 PaymentCancel 상태에 반영한다
-     */
-    private void applyCancelResult(PaymentCancel paymentCancel, PgCancelResult cancelResult) {
-        switch (cancelResult.status()) {
-            case SUCCESS -> paymentCancel.success(cancelResult.pgCancelId(), cancelResult.pgResultCode(), cancelResult.pgResultMessage());
-            case FAILED -> paymentCancel.fail(cancelResult.pgResultCode(), cancelResult.pgResultMessage());
-            case UNKNOWN -> paymentCancel.unknown(cancelResult.pgResultCode(), cancelResult.pgResultMessage());
         }
     }
 
@@ -106,5 +112,13 @@ public class PaymentCompensationService {
     private Payment findPayment(String paymentId) {
         return paymentPersistencePort.findByPaymentId(paymentId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
+    }
+
+    /**
+     * cancelId 로 결제 취소 정보를 조회하고, 없으면 예외를 던진다
+     */
+    private PaymentCancel findPaymentCancel(String cancelId) {
+        return paymentCancelPersistencePort.findByCancelId(cancelId)
+                .orElseThrow(() -> new PaymentCancelNotFoundException(cancelId));
     }
 }

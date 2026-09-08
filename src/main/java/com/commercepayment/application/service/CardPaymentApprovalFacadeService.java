@@ -1,23 +1,20 @@
 package com.commercepayment.application.service;
 
 import com.commercepayment.adapter.out.persistence.entity.AuthStatus;
+import com.commercepayment.adapter.out.persistence.entity.PaymentCancel;
 import com.commercepayment.adapter.out.persistence.entity.PaymentStatus;
 import com.commercepayment.application.dto.PaymentApprovalCommand;
 import com.commercepayment.application.dto.PaymentApprovalResult;
 import com.commercepayment.application.dto.PaymentAuthRegistrationResult;
 import com.commercepayment.application.dto.PgApprovalRequest;
 import com.commercepayment.application.dto.PgApprovalResult;
-import com.commercepayment.application.dto.PgCancelRequest;
-import com.commercepayment.application.dto.PgCancelResult;
 import com.commercepayment.application.port.in.ProcessCardPaymentApprovalUseCase;
 import com.commercepayment.application.port.out.DistributedLockPort;
 import com.commercepayment.application.port.out.PgApprovalPort;
-import com.commercepayment.application.port.out.PgCancelPort;
 import com.commercepayment.common.exception.PaymentCompensatedException;
 import com.commercepayment.common.lock.PaymentLockKeyGenerator;
 import com.commercepayment.config.PaymentLockProperties;
 import com.commercepayment.domain.payment.PgApprovalStatus;
-import com.commercepayment.domain.payment.PgCancelStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -38,8 +35,8 @@ public class CardPaymentApprovalFacadeService implements ProcessCardPaymentAppro
     private final PaymentAuthRegistrationService paymentAuthRegistrationService;
     private final PaymentResultService paymentResultService;
     private final PaymentCompensationService paymentCompensationService;
+    private final PaymentCancelExecutionService paymentCancelExecutionService;
     private final PgApprovalPort pgApprovalPort;
-    private final PgCancelPort pgCancelPort;
 
     /**
      * 분산락을 획득한 뒤 결제 승인 플로우 전체를 실행하고, 종료 시 락을 해제한다
@@ -67,7 +64,7 @@ public class CardPaymentApprovalFacadeService implements ProcessCardPaymentAppro
             paymentResultService.applyApprovalResult(registration.paymentId(), approvalResult);
         } catch (Exception e) {
             log.error("TX2(결제 결과 반영) 실패, 보상 처리를 시작합니다. paymentId={}", registration.paymentId(), e);
-            compensate(registration.paymentId(), command, approvalResult);
+            compensate(registration.paymentId(), approvalResult);
             throw new PaymentCompensatedException(registration.paymentId(), "결제 결과 반영에 실패하여 보상 처리(망취소)를 완료했습니다.");
         }
 
@@ -88,24 +85,12 @@ public class CardPaymentApprovalFacadeService implements ProcessCardPaymentAppro
     }
 
     /**
-     * TX2 실패 시 PG 망취소를 호출하고 보상 트랜잭션(TX3)을 수행한다
+     * TX2 실패 시 PaymentCancel(PENDING) 을 먼저 커밋한 뒤, PG 조회/망취소 실행을 위임한다.
+     * PG 호출 도중 앱이 죽어도 이미 커밋된 PaymentCancel 을 recovery scheduler 가 이어받아 재처리할 수 있다.
      */
-    private void compensate(String paymentId, PaymentApprovalCommand command, PgApprovalResult approvalResult) {
-        PgCancelResult cancelResult = requestPgCancel(paymentId, command, approvalResult);
-        paymentCompensationService.recordCompensation(paymentId, approvalResult, cancelResult);
-    }
-
-    /**
-     * PG 망취소 API를 호출하고, 통신 예외가 발생해도 보상 이력은 반드시 남긴다
-     */
-    private PgCancelResult requestPgCancel(String paymentId, PaymentApprovalCommand command, PgApprovalResult approvalResult) {
-        try {
-            PgCancelRequest request = new PgCancelRequest(command.mId(), command.pgAuthKey(), approvalResult.approvedAmount(), "TX2_FAILURE_COMPENSATION");
-            return pgCancelPort.cancel(command.pgProvider(), request);
-        } catch (Exception e) {
-            log.error("PG 망취소 호출에 실패해 UNKNOWN으로 기록합니다. paymentId={}", paymentId, e);
-            return new PgCancelResult(PgCancelStatus.UNKNOWN, null, "CANCEL_COMMUNICATION_ERROR", e.getMessage());
-        }
+    private void compensate(String paymentId, PgApprovalResult approvalResult) {
+        PaymentCancel pendingCancel = paymentCompensationService.recordPendingCancel(paymentId, approvalResult);
+        paymentCancelExecutionService.executeCancel(pendingCancel.getCancelId());
     }
 
     /**

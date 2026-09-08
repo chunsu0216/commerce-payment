@@ -5,8 +5,11 @@ import com.commercepayment.application.dto.PgApprovalRequest;
 import com.commercepayment.application.dto.PgApprovalResult;
 import com.commercepayment.application.dto.PgCancelRequest;
 import com.commercepayment.application.dto.PgCancelResult;
+import com.commercepayment.application.dto.PgInquiryRequest;
+import com.commercepayment.application.dto.PgInquiryResult;
 import com.commercepayment.domain.payment.PgApprovalStatus;
 import com.commercepayment.domain.payment.PgCancelStatus;
+import com.commercepayment.domain.payment.PgInquiryStatus;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,5 +38,13 @@ class InicisPgApprovalStrategyImplTest {
 
         assertThat(result.status()).isEqualTo(PgCancelStatus.SUCCESS);
         assertThat(result.pgCancelId()).isNotBlank();
+    }
+
+    @Test
+    void 거래결과_조회_요청은_항상_승인_유지_상태를_리턴한다() {
+        PgInquiryResult result = strategy.inquire(new PgInquiryRequest("mid", "authKey", "cancel-1"));
+
+        assertThat(result.status()).isEqualTo(PgInquiryStatus.APPROVED);
+        assertThat(result.pgTransactionId()).isNotBlank();
     }
 }
